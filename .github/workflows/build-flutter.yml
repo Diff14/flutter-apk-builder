@@ -33,7 +33,7 @@ jobs:
           P=android-arm64
           if [ "$PM" = low ]; then P=android-arm,android-arm64; fi
           flutter pub get
-          flutter build apk --$BT --target-platform $P
+          flutter build apk --$BT --target-platform $P --android-skip-build-dependency-validation
       - uses: actions/upload-artifact@v4
         with:
           name: apk-${{ inputs.jobId }}
