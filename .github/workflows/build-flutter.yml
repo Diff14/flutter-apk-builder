@@ -1,0 +1,40 @@
+name: build-flutter
+on:
+  workflow_dispatch:
+    inputs:
+      jobId: {required: true, type: string}
+      userId: {required: false, default: "0", type: string}
+      payload: {required: true, type: string}
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ambil ZIP
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PAYLOAD: ${{ inputs.payload }}
+        run: |
+          echo "$PAYLOAD" > p.json
+          gh release download "$(jq -r .tag p.json)" -R "${{ github.repository }}" -p '*.zip' -D dl
+          unzip -q dl/*.zip -d src
+          F=$(find src -name pubspec.yaml | awk '{print length($0),$0}' | sort -n | head -1 | cut -d' ' -f2-)
+          echo "PD=$(dirname "$F")" >> $GITHUB_ENV
+          echo "BT=$(jq -r '.buildType // "release"' p.json)" >> $GITHUB_ENV
+          echo "PM=$(jq -r '.perfMode // "fast"' p.json)" >> $GITHUB_ENV
+      - uses: actions/setup-java@v4
+        with: {distribution: temurin, java-version: "17"}
+      - uses: subosito/flutter-action@v2
+        with: {channel: stable, cache: true}
+      - name: Build
+        working-directory: ${{ env.PD }}
+        run: |
+          P=android-arm64
+          if [ "$PM" = low ]; then P=android-arm,android-arm64; fi
+          flutter pub get
+          flutter build apk --$BT --target-platform $P
+      - uses: actions/upload-artifact@v4
+        with:
+          name: apk-${{ inputs.jobId }}
+          path: ${{ env.PD }}/build/app/outputs/flutter-apk/app-*.apk
