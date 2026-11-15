@@ -1,40 +1,283 @@
-name: build-flutter
+name: Flutter APK Builder
+
 on:
   workflow_dispatch:
     inputs:
-      jobId: {required: true, type: string}
-      userId: {required: false, default: "0", type: string}
-      payload: {required: true, type: string}
+      jobId:
+        description: Build job ID
+        required: true
+        type: string
+      userId:
+        description: User ID
+        required: false
+        default: "0"
+        type: string
+      payload:
+        description: Release build configuration JSON
+        required: true
+        type: string
+
 permissions:
   contents: read
+
+concurrency:
+  group: flutter-apk-${{ inputs.jobId }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build Flutter APK
     runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    env:
+      GH_TOKEN: ${{ github.token }}
+      JOB_ID: ${{ inputs.jobId }}
+      USER_ID: ${{ inputs.userId }}
+      PAYLOAD: ${{ inputs.payload }}
+
     steps:
-      - name: Ambil ZIP
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PAYLOAD: ${{ inputs.payload }}
+      - name: Prepare build configuration
+        id: config
+        shell: bash
         run: |
-          echo "$PAYLOAD" > p.json
-          gh release download "$(jq -r .tag p.json)" -R "${{ github.repository }}" -p '*.zip' -D dl
-          unzip -q dl/*.zip -d src
-          F=$(find src -name pubspec.yaml | awk '{print length($0),$0}' | sort -n | head -1 | cut -d' ' -f2-)
-          echo "PD=$(dirname "$F")" >> $GITHUB_ENV
-          echo "BT=$(jq -r '.buildType // "release"' p.json)" >> $GITHUB_ENV
-          echo "PM=$(jq -r '.perfMode // "fast"' p.json)" >> $GITHUB_ENV
-      - uses: actions/setup-java@v4
-        with: {distribution: temurin, java-version: "17"}
-      - uses: subosito/flutter-action@v2
-        with: {channel: stable, cache: true}
-      - name: Build
-        working-directory: ${{ env.PD }}
+          set -euo pipefail
+
+          printf '%s' "$PAYLOAD" > "$RUNNER_TEMP/payload.json"
+          jq empty "$RUNNER_TEMP/payload.json"
+
+          TAG="$(jq -r '.tag // empty' "$RUNNER_TEMP/payload.json")"
+          BUILD_TYPE="$(jq -r '.buildType // "release"' "$RUNNER_TEMP/payload.json")"
+          PERF_MODE="$(jq -r '.perfMode // "fast"' "$RUNNER_TEMP/payload.json")"
+          FLUTTER_CHANNEL="$(jq -r '.flutterChannel // "stable"' "$RUNNER_TEMP/payload.json")"
+
+          case "$BUILD_TYPE" in
+            release|debug|profile) ;;
+            *) echo "Invalid buildType: $BUILD_TYPE"; exit 1 ;;
+          esac
+
+          case "$FLUTTER_CHANNEL" in
+            stable|beta|master) ;;
+            *) echo "Invalid flutterChannel: $FLUTTER_CHANNEL"; exit 1 ;;
+          esac
+
+          if [ -z "$TAG" ]; then
+            echo "Payload is missing the release tag."
+            exit 1
+          fi
+
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "build_type=$BUILD_TYPE" >> "$GITHUB_OUTPUT"
+          echo "perf_mode=$PERF_MODE" >> "$GITHUB_OUTPUT"
+          echo "flutter_channel=$FLUTTER_CHANNEL" >> "$GITHUB_OUTPUT"
+
+      - name: Download source ZIP from GitHub Release
+        shell: bash
         run: |
-          P=android-arm64
-          if [ "$PM" = low ]; then P=android-arm,android-arm64; fi
+          set -euo pipefail
+
+          mkdir -p "$RUNNER_TEMP/release" "$RUNNER_TEMP/source"
+
+          gh release download "${{ steps.config.outputs.tag }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*.zip' \
+            --dir "$RUNNER_TEMP/release"
+
+          mapfile -t ZIP_FILES < <(find "$RUNNER_TEMP/release" -maxdepth 1 -type f -name '*.zip')
+
+          if [ "${#ZIP_FILES[@]}" -ne 1 ]; then
+            echo "Expected exactly one ZIP file; found ${#ZIP_FILES[@]}."
+            exit 1
+          fi
+
+          unzip -t "${ZIP_FILES[0]}"
+          unzip -q "${ZIP_FILES[0]}" -d "$RUNNER_TEMP/source"
+
+      - name: Detect Flutter project
+        id: project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR="$(
+            find "$RUNNER_TEMP/source" -type f -name pubspec.yaml \
+              -not -path '*/.dart_tool/*' \
+              -printf '%d\t%h\n' |
+            sort -n |
+            head -n 1 |
+            cut -f2-
+          )"
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/pubspec.yaml" ]; then
+            echo "Flutter pubspec.yaml not found in source ZIP."
+            exit 1
+          fi
+
+          echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
+          echo "Detected project: $PROJECT_DIR"
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: ${{ steps.config.outputs.flutter_channel }}
+          cache: true
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Show build environment
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          flutter --version
+          java -version
+          flutter doctor -v
+          echo "----- Android Gradle configuration -----"
+          find android -maxdepth 3 -type f \
+            \( -name '*.gradle' -o -name '*.gradle.kts' -o -name 'gradle-wrapper.properties' \) \
+            -print
+
+      - name: Install Flutter dependencies
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
           flutter pub get
-          flutter build apk --$BT --target-platform $P --android-skip-build-dependency-validation
-      - uses: actions/upload-artifact@v4
+
+      - name: Build APK
+        id: apk
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          CONFIG="$RUNNER_TEMP/payload.json"
+          BUILD_TYPE="${{ steps.config.outputs.build_type }}"
+          PERF_MODE="${{ steps.config.outputs.perf_mode }}"
+
+          ARGS=(apk "--$BUILD_TYPE")
+
+          TARGET_PLATFORM="$(jq -r '.targetPlatform // empty' "$CONFIG")"
+
+          if [ -z "$TARGET_PLATFORM" ]; then
+            if [ "$PERF_MODE" = "low" ]; then
+              TARGET_PLATFORM="android-arm,android-arm64"
+            else
+              TARGET_PLATFORM="android-arm64"
+            fi
+          fi
+
+          ARGS+=(--target-platform "$TARGET_PLATFORM")
+
+          if [ "$(jq -r '.splitPerAbi // false' "$CONFIG")" = "true" ]; then
+            ARGS+=(--split-per-abi)
+          fi
+
+          FLAVOR="$(jq -r '.flavor // empty' "$CONFIG")"
+          TARGET="$(jq -r '.target // empty' "$CONFIG")"
+          BUILD_NAME="$(jq -r '.buildName // empty' "$CONFIG")"
+          BUILD_NUMBER="$(jq -r '.buildNumber // empty' "$CONFIG")"
+
+          [ -z "$FLAVOR" ] || ARGS+=(--flavor "$FLAVOR")
+          [ -z "$TARGET" ] || ARGS+=(--target "$TARGET")
+          [ -z "$BUILD_NAME" ] || ARGS+=(--build-name "$BUILD_NAME")
+          [ -z "$BUILD_NUMBER" ] || ARGS+=(--build-number "$BUILD_NUMBER")
+
+          if [ "$(jq -r '.treeShakeIcons // true' "$CONFIG")" = "true" ]; then
+            ARGS+=(--tree-shake-icons)
+          fi
+
+          if [ "$(jq -r '.obfuscate // false' "$CONFIG")" = "true" ]; then
+            mkdir -p "$RUNNER_TEMP/symbols"
+            ARGS+=(--obfuscate --split-debug-info="$RUNNER_TEMP/symbols")
+          fi
+
+          while IFS= read -r DEFINE; do
+            [ -z "$DEFINE" ] || ARGS+=(--dart-define="$DEFINE")
+          done < <(jq -r '.dartDefines[]? // empty' "$CONFIG")
+
+          DEFINE_FILE="$(jq -r '.dartDefineFile // empty' "$CONFIG")"
+          if [ -n "$DEFINE_FILE" ]; then
+            if [ ! -f "$DEFINE_FILE" ]; then
+              echo "dartDefineFile not found: $DEFINE_FILE"
+              exit 1
+            fi
+
+            while IFS= read -r DEFINE || [ -n "$DEFINE" ]; do
+              [ -z "$DEFINE" ] || ARGS+=(--dart-define="$DEFINE")
+            done < "$DEFINE_FILE"
+          fi
+
+          echo "Build type: $BUILD_TYPE"
+          echo "Target platform: $TARGET_PLATFORM"
+          echo "Running: flutter build ${ARGS[*]}"
+
+          flutter build "${ARGS[@]}"
+
+          OUTPUT_DIR="build/app/outputs/flutter-apk"
+          if [ ! -d "$OUTPUT_DIR" ]; then
+            echo "APK output directory not found."
+            exit 1
+          fi
+
+          mkdir -p "$RUNNER_TEMP/artifacts/apk"
+          find "$OUTPUT_DIR" -maxdepth 1 -type f -name '*.apk' \
+            -exec cp {} "$RUNNER_TEMP/artifacts/apk/" \;
+
+          if ! find "$RUNNER_TEMP/artifacts/apk" -type f -name '*.apk' | grep -q .; then
+            echo "No APK files were generated."
+            exit 1
+          fi
+
+          if [ -d "$RUNNER_TEMP/symbols" ]; then
+            cp -r "$RUNNER_TEMP/symbols" "$RUNNER_TEMP/artifacts/"
+          fi
+
+          echo "Generated APK files:"
+          ls -lh "$RUNNER_TEMP/artifacts/apk"
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v4
         with:
           name: apk-${{ inputs.jobId }}
-          path: ${{ env.PD }}/build/app/outputs/flutter-apk/app-*.apk
+          path: ${{ runner.temp }}/artifacts/**
+          if-no-files-found: error
+          compression-level: 6
+          retention-days: 14
+
+      - name: Build summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "## Flutter APK Build"
+            echo ""
+            echo "- Job ID: \`$JOB_ID\`"
+            echo "- User ID: \`$USER_ID\`"
+            echo "- Repository: \`$GITHUB_REPOSITORY\`"
+            echo "- Release tag: \`${{ steps.config.outputs.tag }}\`"
+            echo "- Build type: \`${{ steps.config.outputs.build_type }}\`"
+            echo "- Status: \`${{ job.status }}\`"
+            echo ""
+            if [ -d "$RUNNER_TEMP/artifacts/apk" ]; then
+              echo "### Generated APK files"
+              ls -lh "$RUNNER_TEMP/artifacts/apk"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics-${{ inputs.jobId }}
+          path: |
+            ${{ runner.temp }}/payload.json
+            ${{ runner.temp }}/source/
+          if-no-files-found: ignore
+          retention-days: 7
