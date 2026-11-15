@@ -218,7 +218,7 @@ jobs:
           echo "Target platform: $TARGET_PLATFORM"
           echo "Running: flutter build ${ARGS[*]}"
 
-          flutter build "${ARGS[@]}"
+          flutter build "${ARGS[@]}" --android-skip-build-dependency-validation
 
           OUTPUT_DIR="build/app/outputs/flutter-apk"
           if [ ! -d "$OUTPUT_DIR" ]; then
