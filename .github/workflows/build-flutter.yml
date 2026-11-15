@@ -116,16 +116,85 @@ jobs:
           echo "project_dir=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
           echo "Detected project: $PROJECT_DIR"
 
+      - name: Resolve Android toolchain
+        id: toolchain
+        working-directory: ${{ steps.project.outputs.project_dir }}
+        shell: bash
+        env:
+          REQUESTED_VERSION: ${{ fromJSON(inputs.payload).flutterVersion || '' }}
+          REQUESTED_CHANNEL: ${{ steps.config.outputs.flutter_channel }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PYTHON'
+          import os, re
+          from pathlib import Path
+
+          files = []
+          android = Path("android")
+          if android.exists():
+              files = [p for p in android.rglob("*")
+                       if p.is_file() and p.suffix.lower() in
+                       {".gradle", ".kts", ".toml", ".properties"}]
+          source = "\n".join(p.read_text(errors="ignore") for p in files)
+
+          patterns = [
+              r"""com\.android\.application["')\s]*version\s*["']([0-9]+(?:\.[0-9]+)+)""",
+              r"com\.android\.tools\.build:gradle:([0-9]+(?:\.[0-9]+)+)",
+              r"""(?m)^\s*agp\s*=\s*["']([0-9]+(?:\.[0-9]+)+)"""
+          ]
+          agp = next((m.group(1) for x in patterns
+                      if (m := re.search(x, source))), "")
+          requested = os.getenv("REQUESTED_VERSION", "").strip()
+          channel = os.getenv("REQUESTED_CHANNEL", "stable").strip()
+
+          if requested:
+              flutter, reason = requested, "payload override"
+          elif channel != "stable":
+              flutter, reason = "", f"channel {channel}"
+          elif not agp:
+              flutter, reason = "3.32.8", "AGP not detected; safe fallback"
+          else:
+              v = tuple(map(int, agp.split(".")))
+              if v >= (9, 1, 1):
+                  flutter, reason = "", f"latest stable for AGP {agp}"
+              elif v >= (8, 1, 0):
+                  flutter, reason = "3.32.8", f"compatible track for AGP {agp}"
+              elif v >= (7, 1, 0):
+                  flutter, reason = "3.24.5", f"legacy track for AGP {agp}"
+              else:
+                  flutter, reason = "3.19.6", f"older AGP {agp}"
+
+          wrapper = Path("android/gradle/wrapper/gradle-wrapper.properties")
+          gradle = ""
+          if wrapper.exists():
+              m = re.search(r"gradle-([0-9.]+)-(?:all|bin)\.zip",
+                            wrapper.read_text(errors="ignore"))
+              if m:
+                  gradle = m.group(1)
+
+          java = "17"
+          if gradle and tuple(map(int, gradle.split("."))) < (7, 3):
+              java = "11"
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as out:
+              out.write(f"flutter_version={flutter}\n")
+              out.write(f"java_version={java}\n")
+          print(f"AGP: {agp or 'unknown'} | Gradle: {gradle or 'wrapper default'}")
+          print(f"Flutter: {flutter or channel} | Java: {java}")
+          print(f"Selection: {reason}")
+          PYTHON
+
       - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: "17"
+          java-version: ${{ steps.toolchain.outputs.java_version }}
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
         with:
           channel: ${{ steps.config.outputs.flutter_channel }}
+          flutter-version: ${{ steps.toolchain.outputs.flutter_version }}
           cache: true
 
       - name: Set up Gradle cache
@@ -148,10 +217,6 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          WRAPPER="android/gradle/wrapper/gradle-wrapper.properties"
-          if [ -f "$WRAPPER" ]; then
-            sed -i -E "s#gradle-[0-9.]+-(all|bin)\.zip#gradle-9.3.1-bin.zip#" "$WRAPPER"
-          fi
           flutter pub get
 
       - name: Build APK
